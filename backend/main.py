@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 import uuid
@@ -7,6 +8,7 @@ import json
 import logging
 import re
 from sniper import Sniper
+from ai import AIAnalyzer
 from typing import List, Optional, Dict
 from youtube_transcript_api import YouTubeTranscriptApi
 
@@ -20,7 +22,11 @@ OUTPUT_DIR = "static/clips"
 METADATA_FILE = "static/clips.json"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Mount static files
+# Initialize AI Analyzer
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+analyzer = AIAnalyzer(GOOGLE_API_KEY) if GOOGLE_API_KEY else None
+
+# Mount static files for clips
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 sniper = Sniper(output_dir=OUTPUT_DIR)
@@ -44,15 +50,13 @@ def save_metadata(clip_info: ClipInfo):
             with open(METADATA_FILE, "r") as f:
                 metadata = json.load(f)
         except:
-            pass
+            metadata = []
     
     metadata.append(clip_info.dict())
-    
     with open(METADATA_FILE, "w") as f:
         json.dump(metadata, f, indent=2)
 
 def get_video_id(url: str) -> Optional[str]:
-    # Extract video id from various youtube url formats
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'(?:embed\/)([0-9A-Za-z_-]{11}).*',
@@ -65,28 +69,6 @@ def get_video_id(url: str) -> Optional[str]:
             return match.group(1)
     return None
 
-def find_timestamps_dummy(transcript: List[Dict], requirements: str) -> List[Dict]:
-    # Very basic keyword search in transcript
-    results = []
-    keywords = requirements.lower().split()
-    for entry in transcript:
-        text = entry['text'].lower()
-        if any(kw in text for kw in keywords):
-            start = int(entry['start'])
-            # Return a 30s window around the keyword
-            results.append({
-                "start": start,
-                "end": start + 30
-            })
-            if len(results) >= 3: # Limit to 3 clips for dummy
-                break
-    
-    if not results:
-        # Fallback to first 30s
-        results.append({"start": 0, "end": 30})
-    
-    return results
-
 @app.post("/process", response_model=List[ClipInfo])
 async def process_video(request: ClipRequest):
     try:
@@ -97,16 +79,17 @@ async def process_video(request: ClipRequest):
         if not video_id:
             raise HTTPException(status_code=400, detail="Invalid YouTube URL")
 
-        clips = []
-        
-        # Try to get transcript
-        try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id)
-            found_segments = find_timestamps_dummy(transcript, request.requirements)
-        except Exception as e:
-            logger.warning(f"Could not get transcript: {e}")
-            found_segments = [{"start": 0, "end": 30}] # Default fallback
+        if analyzer:
+            found_segments = analyzer.find_clips(video_id, request.requirements)
+        else:
+            logger.warning("AI Analyzer not initialized, using dummy logic")
+            # Fallback dummy logic
+            found_segments = [{"start": 0, "end": 30, "reason": "Dummy clip"}]
 
+        if not found_segments:
+             raise HTTPException(status_code=404, detail="No relevant segments found")
+
+        clips = []
         for segment in found_segments:
             clip_id = str(uuid.uuid4())
             start = segment["start"]
@@ -132,12 +115,10 @@ async def process_video(request: ClipRequest):
                 end_time=end_str,
                 clip_url=f"/static/clips/{clip_id}.mp4"
             )
-            
             save_metadata(clip_info)
             clips.append(clip_info)
-        
+            
         return clips
-        
     except Exception as e:
         logger.error(f"Error in process_video: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -151,6 +132,15 @@ async def get_clips():
         except:
             return []
     return []
+
+# Serve frontend
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
+if os.path.exists(FRONTEND_DIST):
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    @app.get("/")
+    async def root():
+        return {"message": "ClipSniper API is running. Frontend dist not found."}
 
 if __name__ == "__main__":
     import uvicorn

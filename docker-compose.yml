@@ -1,0 +1,10 @@
+services:
+  clipsniper:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+    volumes:
+      - ./static:/app/backend/static
+    restart: unless-stopped
